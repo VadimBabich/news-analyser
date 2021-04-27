@@ -60,17 +60,35 @@ public class SimpleStatistics implements EventListener<News>, Runnable, Closeabl
         future.cancel(false);
     }
 
+    /**
+     * This method is run by the scheduler and collects statistics for the consumer.
+     *
+     */
     @Override
     public void run() {
+        //Started it off as an optimistic reading, because the writing incoming data is more important then collect statistics
         long stamp = lock.tryOptimisticRead();
 
         long counterValue = newsCounter;
         NavigableMap<News, Integer> newsIntegerNavigableMap = topPositiveNews;
 
         try {
+            //after collecting data, tries to reset existing data.
+            //Copied the link to the rating map and the value for the counter.
+            // In this case, the copied counter value may differ from the contents of the rating map,
+            // because the map is still receiving messages, and the previously used counter is also incremented,
+            // and this appears to be an inconsistent state of the counter and rating map.
+            //
+            // Then I check this situation - were there any updates while I copied the counter value and the map reference?
+            // If not (optimistic case) - I get a write lock and reset the counter and card.
+            // If any update has happened, a pessimistic scenario is applied and a write lock to read / update the data.
+            //
+            // Maybe in this case it is not necessary and pessimistic locking can be used every time for these updates,
+            // but I wanted to demonstrate this approach.
             while (true) {
+                //trying to get write lock
                 long ws = lock.tryConvertToWriteLock(stamp);
-
+                //if there are new data in the statistics, read them again
                 if (ws == 0L) {
                     stamp = lock.writeLock();
                     counterValue = newsCounter;
@@ -78,26 +96,42 @@ public class SimpleStatistics implements EventListener<News>, Runnable, Closeabl
                     continue;
                 }
 
+                //reset existing data.
                 stamp = ws;
                 topPositiveNews = createReference(pieceOfNewsComparator);
                 newsCounter = 0;
                 break;
             }
         } finally {
+            //reset lock )
             lock.unlock(stamp);
         }
+        //provide the consumer with statistics.
         statConsumer.accept(toSimpleStatisticsResult(counterValue, newsIntegerNavigableMap));
 
     }
 
+    /**
+     * Put new message to statistic.
+     * @param message message from socket worker
+     */
     @Override
     public void onPositiveNews(SocketMessage<News> message) {
         try {
+            //waiting for write lock to increase counter and update message priority
+            // There is a synchronized block, can be used instead of tryWriteLock.
+            // But I think it's really important not to block the socket worker thread for a unpredictable period of time,
+            // for this reason tryLock has a timeout.
             if (0 == lock.tryWriteLock(50, TimeUnit.MILLISECONDS)) {
+                //There may be an exception because the message was lost.
+                // But i preferred to implement it as a quiet return.
                 return;
             }
+            //increase the positive news counter
             newsCounter++;
 
+            //update message priority if the same message has already been received with a different priority.
+            //and put if it is a new one
             topPositiveNews.compute(message.getPayload(), (pieceOfNews, priority) -> {
                 if (null == priority) {
                     return message.getPayload().getPriority();
@@ -108,8 +142,10 @@ public class SimpleStatistics implements EventListener<News>, Runnable, Closeabl
                 return message.getPayload().getPriority();
             });
         } catch (InterruptedException e) {
+            //set interrupted flag of thread if the current thread was interrupted while it was waiting for a write lock.
             Thread.currentThread().interrupt();
         } finally {
+            //unlock write lock )
             lock.tryUnlockWrite();
         }
     }
